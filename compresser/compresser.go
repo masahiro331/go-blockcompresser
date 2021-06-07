@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"io"
+	"math/bits"
 	"os"
 	"unsafe"
 
@@ -13,7 +14,7 @@ import (
 var (
 	_ CompressedFile = &File{}
 
-	BitMaskLUT = []byte{
+	BitMaskLUT = []uint8{
 		0b00000001,
 		0b00000010,
 		0b00000100,
@@ -62,15 +63,22 @@ func NewCompressedFile(f *os.File) (*File, error) {
 	if err = binary.Read(f, binary.BigEndian, &header.Core); err != nil {
 		return nil, xerrors.Errorf("failed to parse header core: %w", err)
 	}
-	_, err = f.Seek(-16-int64(header.Core.MapSize), 2)
+	_, err = f.Seek(int64(header.Core.Size), 0)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to seek: %w", err)
 	}
-	header.CompressedTable = make([]byte, header.Core.MapSize)
-	if _, err := f.Read(header.CompressedTable); err != nil {
-		return nil, xerrors.Errorf("failed to read compressedTable: %w", err)
-	}
 
+	for i := uint64(0); i < header.Core.MapSize; i++ {
+		node := Node{}
+		if err = binary.Read(f, binary.BigEndian, &node.PrePopCount); err != nil {
+			return nil, xerrors.Errorf("failed to parse pre popcount: %w", err)
+		}
+		if err = binary.Read(f, binary.BigEndian, &node.CompressedMap); err != nil {
+			return nil, xerrors.Errorf("failed to parse compressed map: %w", err)
+		}
+		header.CompressedTable = append(header.CompressedTable, node)
+	}
+	f.Seek(0, 0)
 	return &File{
 		File:   *f,
 		Header: header,
@@ -82,11 +90,17 @@ type Core struct {
 	BlockSize uint32 // Block Size
 	FSSize    uint64 // DeCompressedFile Size
 	MapSize   uint64 // CompressedMap Size
+	Size      uint64 // CompressedFile Size ignore Header
 }
 
 type Header struct {
 	Core            Core
-	CompressedTable []byte // All zero block is 1, other 0
+	CompressedTable []Node // All zero block is 1, other 0
+}
+
+type Node struct {
+	PrePopCount   uint64
+	CompressedMap uint8
 }
 
 type File struct {
@@ -130,7 +144,7 @@ func (f *File) flush() (int, error) {
 	}
 
 	var cn int
-	compressedMap := byte(0x00) // 0000 0000
+	compressedMap := uint8(0x00) // 0000 0000
 
 	for i := 0; i < ChunkSize; i++ {
 		buf := make([]byte, f.Header.Core.BlockSize)
@@ -153,7 +167,8 @@ func (f *File) flush() (int, error) {
 		}
 		cn += n
 	}
-	f.Header.CompressedTable = append(f.Header.CompressedTable, compressedMap)
+	f.Header.CompressedTable = append(f.Header.CompressedTable, Node{CompressedMap: compressedMap})
+	f.Header.Core.Size += uint64(cn)
 	return cn, nil
 }
 
@@ -166,16 +181,28 @@ func (f *File) Read(buf []byte) (int, error) {
 		return 0, xerrors.Errorf("invalid bytes size error read only %d byte length", f.Header.Core.BlockSize)
 	}
 
-	if uint64(len(f.Header.CompressedTable)) < f.currentBlockOffset/ChunkSize {
+	if uint64(len(f.Header.CompressedTable)) <= f.currentBlockOffset/ChunkSize {
 		return 0, io.EOF
 	}
-	compressedMap := f.Header.CompressedTable[f.currentBlockOffset/ChunkSize]
-	if compressedMap&BitMaskLUT[f.currentBlockOffset%ChunkSize] != 0 {
+
+	defer func() {
+		f.currentBlockOffset++
+	}()
+
+	node := f.Header.CompressedTable[f.currentBlockOffset/ChunkSize]
+	if node.CompressedMap&BitMaskLUT[f.currentBlockOffset%ChunkSize] != 0 {
 		return int(f.Header.Core.BlockSize), nil
 	}
 
-	f.currentBlockOffset++
-	return 0, nil
+	i, err := f.File.Read(buf)
+	if err != nil {
+		if err == io.EOF {
+			return 0, err
+		}
+		return 0, xerrors.Errorf("failed to read file: %w", err)
+	}
+
+	return i, nil
 }
 
 func (f *File) Close() error {
@@ -189,10 +216,15 @@ func (f *File) Close() error {
 		return xerrors.Errorf("failed to flush with tail buffer: %w", err)
 	}
 
+	prePopcount := uint64(0)
 	for _, node := range f.Header.CompressedTable {
+		node.PrePopCount = prePopcount
 		if err := binary.Write(&f.File, binary.BigEndian, node); err != nil {
 			return err
 		}
+
+		popCount := bits.OnesCount8(node.CompressedMap)
+		prePopcount += uint64(popCount)
 	}
 	f.Header.Core.MapSize = uint64(len(f.Header.CompressedTable))
 	if err := binary.Write(&f.File, binary.BigEndian, f.Header.Core); err != nil {

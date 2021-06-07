@@ -64,5 +64,29 @@ func main() {
 				}
 			}
 		}
+
+	case "read":
+		cf, err := compresser.NewCompressedFile(f)
+		if err != nil {
+			log.Fatal(err)
+		}
+		df, err := os.Create("image.xfs")
+		if err != nil {
+			log.Fatal(err)
+		}
+		for {
+			buf := make([]byte, cf.Header.Core.BlockSize)
+			_, err := cf.Read(buf)
+			if err != nil {
+				if err == io.EOF {
+					break
+				}
+				log.Fatal(err)
+			}
+			_, err = df.Write(buf)
+			if err != nil {
+				log.Fatal(err)
+			}
+		}
 	}
 }
